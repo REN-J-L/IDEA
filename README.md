@@ -62,11 +62,6 @@ Dataset descriptions and download links are provided in the corresponding data r
 No newly generated experimental sequencing data are included in the repository.
 
 
-## Reproducibility
-
-Scripts and notebooks corresponding to the analyses presented in the manuscript are provided in this repository.
-
-
 ## License
 
 This project is released under the [LICENSE](./LICENSE) included in this repository.
