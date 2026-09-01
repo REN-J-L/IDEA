@@ -1,0 +1,43 @@
+# IDEA core dependencies
+# Tested with Python 3.10.16
+
+# Core scientific computing
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.15.2
+scikit-learn==1.7.2
+statsmodels==0.14.5
+joblib==1.5.2
+numba==0.61.2
+
+# Single-cell / spatial transcriptomics
+anndata==0.11.4
+scanpy==1.11.5
+scikit-misc==0.5.2
+igraph==1.0.0
+leidenalg==0.11.0
+louvain==0.8.2
+umap-learn==0.5.9.post2
+
+# Deep learning and interpretation
+# The original environment used torch==2.9.1+cu130 and torchvision==0.24.1+cu130.
+# Install the PyTorch build appropriate for your CUDA/CPU environment if needed.
+torch==2.9.1
+torchvision==0.24.1
+captum==0.8.0
+
+# Data I/O and utilities
+h5py==3.15.1
+tables==3.10.1
+tqdm==4.67.1
+psutil==5.9.0
+PyYAML==6.0.2
+
+# Visualization
+matplotlib==3.10.6
+seaborn==0.13.2
+
+# Additional analysis utilities used in the environment
+POT==0.9.6.post1
+paste-bio==1.4.0
+gseapy==1.1.11

@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.env
+.venv
+venv/
+env/
+ENV/
+.conda/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+.spyproject/
+.ropeproject/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Large biological data
+*.h5ad
+*.h5
+*.hdf5
+*.loom
+*.mtx
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# CSV files
+*.csv
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+models/
+
+# Data folders
+data/
+datasets/
+raw_data/
+
+# Results / outputs
+results/
+output/
+outputs/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*.dat
+*.memmap
+
+tmp/
+temp/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
