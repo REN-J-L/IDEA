@@ -22,8 +22,8 @@ IDEA provides three main analysis modules:
 Clone the repository:
 
 ```bash
-git clone https://github.com/<username>/<repository>.git
-cd <repository>
+git clone https://github.com/REN-J-L/IDEA.git
+cd IDEA
 ```
 
 Create a conda environment:
@@ -44,10 +44,10 @@ pip install -r requirements.txt
 
 Example workflows are provided for:
 
-* Spatial niche identification
-* Multi-slice integration
-* Cell-type composition inference
-* Gene-level interpretation
+* Single-slice spatial niche identification and niche-associated gene analysis
+* Multi-slice spatial niche identification and niche-associated gene analysis
+* Cell-type composition inference and cell-type-associated gene analysis for high-resolution datasets
+* Cell-type composition inference and cell-type-associated gene analysis for low-resolution datasets
 
 See the [`tutorial`](./tutorial) directory for detailed examples.
 
