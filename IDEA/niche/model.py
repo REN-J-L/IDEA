@@ -41,6 +41,7 @@ def init_model(
     classifier_weight=10.0,
     seed=42,
     use_gpu=None,
+    optim = 'NovoGrad'
 ):
     """Initialize IDEA-N.
 
@@ -112,4 +113,5 @@ def init_model(
         classifier_weight=classifier_weight,
         seed=seed,
         use_gpu=use_gpu,
+        optim=optim
     )

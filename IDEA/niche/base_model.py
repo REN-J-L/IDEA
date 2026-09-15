@@ -613,6 +613,895 @@ def _leiden_pseudo_labels(
     return best_labels
 
 
+def _leiden_subsample_label_transfer(
+    features,
+    slice_ids=None,
+
+    # sampling
+    frac=0.1,
+    min_per_slice=2000,
+    n_subsample=None,
+
+    # Leiden
+    n_neighbors=25,
+    n_clusters=None,
+    resolution=1.0,
+    res_range=(0.1, 3.0),
+    res_step=0.1,
+
+    # transfer
+    transfer_k=5,
+    weighted=True,
+    transfer_chunk_size=100000,
+
+    seed=42,
+):
+    """
+    Subsample Leiden clustering + kNN label transfer.
+
+    Parameters
+    ----------
+    features
+        Joint IDEA-N latent representation, shape [N, D].
+
+    slice_ids
+        Integer slice IDs aligned with features.
+
+        Multi-section:
+            balanced sampling is performed within each slice.
+
+        None:
+            global sampling is performed.
+
+    frac
+        Sampling fraction for each slice.
+
+    min_per_slice
+        Minimum sampled spots per slice.
+
+    n_subsample
+        Number of sampled spots for single-section/global mode.
+        If None, use min(200000, N).
+
+    n_neighbors
+        Number of neighbors for Leiden graph construction.
+
+    n_clusters
+        Desired number of Leiden clusters. If not None,
+        resolution search is performed.
+
+    resolution
+        Fixed Leiden resolution when n_clusters is None.
+
+    transfer_k
+        Number of neighbors used for label transfer.
+
+    weighted
+        Whether to use inverse-distance weighted voting.
+
+    transfer_chunk_size
+        Number of spots transferred at once. This avoids creating
+        an N x transfer_k distance/index matrix for very large data.
+
+    seed
+        Random seed.
+
+    Returns
+    -------
+    labels
+        Cluster labels for ALL spots, shape [N].
+
+    sub_idx
+        Global indices of sampled spots.
+
+    sub_labels
+        Leiden labels of sampled spots.
+    """
+
+    features = np.asarray(
+        features,
+        dtype=np.float32,
+    )
+
+    if features.ndim != 2:
+        raise ValueError(
+            "features must have shape [N, D]."
+        )
+
+    N = int(
+        features.shape[0]
+    )
+
+    if N < 2:
+        raise ValueError(
+            "At least two spots are required."
+        )
+
+    rng = np.random.default_rng(
+        seed
+    )
+
+    all_idx = np.arange(
+        N,
+        dtype=np.int64,
+    )
+
+    # ========================================================
+    # 1. Subsampling
+    # ========================================================
+
+    if slice_ids is not None:
+
+        slice_ids = np.asarray(
+            slice_ids
+        )
+
+        if len(slice_ids) != N:
+            raise ValueError(
+                "slice_ids must have the same length "
+                "as features."
+            )
+
+        sub_idx_list = []
+
+        for slice_id in np.unique(
+            slice_ids
+        ):
+
+            idx_s = all_idx[
+                slice_ids == slice_id
+            ]
+
+            n_slice = len(
+                idx_s
+            )
+
+            n_take = max(
+                int(min_per_slice),
+                int(
+                    n_slice
+                    * float(frac)
+                ),
+            )
+
+            n_take = min(
+                n_take,
+                n_slice,
+            )
+
+            chosen = rng.choice(
+                idx_s,
+                size=n_take,
+                replace=False,
+            )
+
+            sub_idx_list.append(
+                chosen
+            )
+
+            print(
+                f"[IDEA-N Leiden] "
+                f"slice={slice_id}: "
+                f"{n_take:,}/{n_slice:,} sampled"
+            )
+
+        sub_idx = np.concatenate(
+            sub_idx_list
+        )
+
+    else:
+
+        if n_subsample is None:
+            n_subsample = min(
+                200000,
+                N,
+            )
+
+        n_subsample = min(
+            int(n_subsample),
+            N,
+        )
+
+        sub_idx = rng.choice(
+            N,
+            size=n_subsample,
+            replace=False,
+        )
+
+    sub_idx = np.sort(
+        sub_idx
+    )
+
+    if len(sub_idx) < 2:
+        raise ValueError(
+            "Too few sampled spots for Leiden."
+        )
+
+    print(
+        f"[IDEA-N Leiden] Total sampled: "
+        f"{len(sub_idx):,}/{N:,} "
+        f"({len(sub_idx) / N:.2%})"
+    )
+
+    # ========================================================
+    # 2. Subsample latent
+    # ========================================================
+
+    X_sub = features[
+        sub_idx
+    ]
+
+    sub_ad = sc.AnnData(
+        X=X_sub
+    )
+
+    n_neighbors_eff = min(
+        int(n_neighbors),
+        len(sub_idx) - 1,
+    )
+
+    # ========================================================
+    # 3. Leiden graph
+    # ========================================================
+
+    sc.pp.neighbors(
+        sub_ad,
+        n_neighbors=n_neighbors_eff,
+        use_rep="X",
+        n_pcs=None,
+    )
+
+    # ========================================================
+    # 4. Leiden clustering
+    # ========================================================
+
+    if n_clusters is None:
+
+        sc.tl.leiden(
+            sub_ad,
+            resolution=float(
+                resolution
+            ),
+            key_added="_leiden_sub",
+            random_state=0,
+        )
+
+        sub_labels = (
+            sub_ad.obs[
+                "_leiden_sub"
+            ]
+            .astype(str)
+            .to_numpy()
+        )
+
+    else:
+
+        best_labels = None
+        best_resolution = None
+        best_diff = np.inf
+
+        for res in np.arange(
+            res_range[0],
+            res_range[1]
+            + res_step / 2,
+            res_step,
+        ):
+
+            sc.tl.leiden(
+                sub_ad,
+                resolution=float(
+                    res
+                ),
+                key_added="_leiden_tmp",
+                random_state=0,
+            )
+
+            labels_tmp = (
+                sub_ad.obs[
+                    "_leiden_tmp"
+                ]
+                .astype(str)
+                .to_numpy()
+            )
+
+            n_found = len(
+                np.unique(
+                    labels_tmp
+                )
+            )
+
+            diff = abs(
+                n_found
+                - int(n_clusters)
+            )
+
+            if diff < best_diff:
+
+                best_diff = diff
+
+                best_labels = (
+                    labels_tmp.copy()
+                )
+
+                best_resolution = float(
+                    res
+                )
+
+            if diff == 0:
+                break
+
+        if best_labels is None:
+            raise RuntimeError(
+                "Leiden resolution search failed."
+            )
+
+        sub_labels = best_labels
+
+        print(
+            f"[IDEA-N Leiden] "
+            f"selected resolution="
+            f"{best_resolution:.3f}, "
+            f"clusters="
+            f"{len(np.unique(sub_labels))}"
+        )
+
+    # ========================================================
+    # 5. Convert labels -> contiguous integer labels
+    # ========================================================
+
+    categorical = pd.Categorical(
+        sub_labels
+    )
+
+    label_names = np.asarray(
+        categorical.categories.astype(
+            str
+        )
+    )
+
+    y_sub = (
+        categorical.codes
+        .astype(
+            np.int32
+        )
+    )
+
+    n_classes = len(
+        label_names
+    )
+
+    print(
+        f"[IDEA-N Leiden] "
+        f"{n_classes} clusters found "
+        f"on sampled spots."
+    )
+
+    # ========================================================
+    # 6. Fit kNN label-transfer model
+    # ========================================================
+
+    transfer_k_eff = min(
+        int(transfer_k),
+        len(sub_idx),
+    )
+
+    if transfer_k_eff <= 0:
+        raise ValueError(
+            "transfer_k must be positive."
+        )
+
+    nn_model = NearestNeighbors(
+        n_neighbors=transfer_k_eff,
+        metric="euclidean",
+        n_jobs=-1,
+    )
+
+    nn_model.fit(
+        X_sub
+    )
+
+    # ========================================================
+    # 7. Chunked label transfer
+    #
+    # Important for million-scale data:
+    #
+    # don't do:
+    # dists, inds = nn.kneighbors(features)
+    #
+    # because this simultaneously creates
+    # N x transfer_k arrays.
+    # ========================================================
+
+    y_pred = np.empty(
+        N,
+        dtype=np.int32,
+    )
+
+    chunk_size = int(
+        transfer_chunk_size
+    )
+
+    if chunk_size <= 0:
+        raise ValueError(
+            "transfer_chunk_size must be positive."
+        )
+
+    for start in tqdm(
+        range(
+            0,
+            N,
+            chunk_size,
+        ),
+        desc="[IDEA-N] label transfer",
+    ):
+
+        end = min(
+            start + chunk_size,
+            N,
+        )
+
+        X_chunk = features[
+            start:end
+        ]
+
+        dists, inds = (
+            nn_model.kneighbors(
+                X_chunk,
+                return_distance=True,
+            )
+        )
+
+        neigh_labels = y_sub[
+            inds
+        ]
+
+        # ----------------------------------------------------
+        # k = 1
+        # ----------------------------------------------------
+
+        if transfer_k_eff == 1:
+
+            chunk_pred = (
+                neigh_labels[:, 0]
+            )
+
+        # ----------------------------------------------------
+        # weighted voting
+        # ----------------------------------------------------
+
+        elif weighted:
+
+            weights = (
+                1.0
+                / (
+                    dists
+                    + 1e-8
+                )
+            ).astype(
+                np.float32,
+                copy=False,
+            )
+
+            m = end - start
+
+            score = np.zeros(
+                (
+                    m,
+                    n_classes,
+                ),
+                dtype=np.float32,
+            )
+
+            row_idx = np.repeat(
+                np.arange(
+                    m,
+                    dtype=np.int64,
+                ),
+                transfer_k_eff,
+            )
+
+            np.add.at(
+                score,
+                (
+                    row_idx,
+                    neigh_labels.reshape(
+                        -1
+                    ),
+                ),
+                weights.reshape(
+                    -1
+                ),
+            )
+
+            chunk_pred = (
+                score.argmax(
+                    axis=1
+                )
+                .astype(
+                    np.int32
+                )
+            )
+
+            del score
+            del weights
+
+        # ----------------------------------------------------
+        # majority voting
+        # ----------------------------------------------------
+
+        else:
+
+            m = end - start
+
+            votes = np.zeros(
+                (
+                    m,
+                    n_classes,
+                ),
+                dtype=np.int16,
+            )
+
+            row_idx = np.repeat(
+                np.arange(
+                    m,
+                    dtype=np.int64,
+                ),
+                transfer_k_eff,
+            )
+
+            np.add.at(
+                votes,
+                (
+                    row_idx,
+                    neigh_labels.reshape(
+                        -1
+                    ),
+                ),
+                1,
+            )
+
+            chunk_pred = (
+                votes.argmax(
+                    axis=1
+                )
+                .astype(
+                    np.int32
+                )
+            )
+
+            del votes
+
+        y_pred[
+            start:end
+        ] = chunk_pred
+
+        del dists
+        del inds
+        del neigh_labels
+        del X_chunk
+
+    # ========================================================
+    # 8. Return integer labels
+    #
+    # Stage 2 expects integer pseudo_labels.
+    # ========================================================
+
+    labels_all = y_pred.astype(
+        np.int64
+    )
+
+    sub_labels_int = y_sub.astype(
+        np.int64
+    )
+
+    del sub_ad
+    del X_sub
+
+    return (
+        labels_all,
+        sub_idx,
+        sub_labels_int,
+    )
+
+def _stratified_sample_indices(
+    labels,
+    max_per_group=None,
+    random_state=42,
+):
+    """
+    Stratified row sampling by niche label.
+
+    Parameters
+    ----------
+    labels : array-like
+        Niche labels for all observations in the current sample.
+
+    max_per_group : int or None
+        Maximum number of observations retained for each niche.
+        If None, all observations are retained.
+
+    random_state : int
+        Random seed.
+
+    Returns
+    -------
+    np.ndarray
+        Sorted row indices.
+    """
+    labels = np.asarray(labels)
+
+    n_obs = int(labels.shape[0])
+
+    if max_per_group is None:
+        return np.arange(n_obs, dtype=np.int64)
+
+    max_per_group = int(max_per_group)
+
+    if max_per_group <= 0:
+        raise ValueError(
+            "max_per_group must be a positive integer or None."
+        )
+
+    rng = np.random.default_rng(
+        int(random_state)
+    )
+
+    selected = []
+
+    for label in np.unique(labels):
+
+        idx = np.flatnonzero(
+            labels == label
+        )
+
+        if len(idx) > max_per_group:
+
+            idx = rng.choice(
+                idx,
+                size=max_per_group,
+                replace=False,
+            )
+
+        selected.append(
+            np.asarray(
+                idx,
+                dtype=np.int64,
+            )
+        )
+
+    if len(selected) == 0:
+        return np.empty(
+            0,
+            dtype=np.int64,
+        )
+
+    selected = np.concatenate(
+        selected
+    )
+
+    # Sorting improves memmap row-access locality.
+    selected.sort()
+
+    return selected
+
+
+
+
+def _run_niche_de(
+    X,
+    labels,
+    gene_names,
+    high_genes=None,
+    sample_name=None,
+    normalize=True,
+    target_sum=1e4,
+    method="wilcoxon",
+):
+    """
+    Run niche-vs-rest differential expression.
+
+    Parameters
+    ----------
+    X
+        Expression matrix, shape [N, G].
+
+    labels
+        IDEA-N niche labels, shape [N].
+
+    gene_names
+        Gene names corresponding to X columns.
+
+    high_genes
+        Candidate genes to retain in the returned table.
+
+        Important:
+            DE itself is still performed over all genes in X,
+            preserving the previous behavior.
+
+    sample_name
+        Optional section/sample name.
+
+    normalize
+        Whether to normalize_total + log1p.
+
+    target_sum
+        Library size after normalization.
+
+    method
+        Method passed to scanpy.tl.rank_genes_groups.
+    """
+
+    gene_names = np.asarray(
+        gene_names,
+        dtype=str,
+    )
+
+    labels = np.asarray(
+        labels
+    ).astype(str)
+
+    if X.shape[0] != len(
+        labels
+    ):
+
+        raise ValueError(
+            f"X has {X.shape[0]} observations, "
+            f"but labels has {len(labels)}."
+        )
+
+    if X.shape[1] != len(
+        gene_names
+    ):
+
+        raise ValueError(
+            f"X has {X.shape[1]} genes, "
+            f"but gene_names has {len(gene_names)}."
+        )
+
+    # ========================================================
+    # Temporary AnnData
+    # ========================================================
+
+    adata = sc.AnnData(
+        X=X,
+    )
+
+    adata.var_names = gene_names
+
+    adata.obs["niche"] = pd.Categorical(
+        labels
+    )
+
+    # ========================================================
+    # Normalization
+    # ========================================================
+
+    if normalize:
+
+        sc.pp.normalize_total(
+            adata,
+            target_sum=target_sum,
+        )
+
+        sc.pp.log1p(
+            adata
+        )
+
+    # ========================================================
+    # DE
+    #
+    # One call is sufficient.
+    # Each niche is automatically compared against the rest.
+    # ========================================================
+
+    sc.tl.rank_genes_groups(
+        adata,
+        groupby="niche",
+        method=method,
+        reference="rest",
+        pts=True,
+    )
+
+    # ========================================================
+    # Candidate gene filter
+    # ========================================================
+
+    if high_genes is None:
+
+        gene_set = set(
+            gene_names
+        )
+
+    else:
+
+        gene_set = {
+            str(g)
+            for g in high_genes
+        }
+
+    de_results = []
+
+    groups = (
+        adata.obs["niche"]
+        .cat.categories
+    )
+
+    rg = adata.uns[
+        "rank_genes_groups"
+    ]
+
+    # ========================================================
+    # Extract DE statistics
+    # ========================================================
+
+    for group in groups:
+
+        group = str(
+            group
+        )
+
+        names = np.asarray(
+            rg["names"][group]
+        )
+
+        pvals = np.asarray(
+            rg["pvals"][group]
+        )
+
+        pvals_adj = np.asarray(
+            rg["pvals_adj"][group]
+        )
+
+        logfc = np.asarray(
+            rg["logfoldchanges"][group]
+        )
+
+        for gene, p, padj, fc in zip(
+            names,
+            pvals,
+            pvals_adj,
+            logfc,
+        ):
+
+            gene = str(
+                gene
+            )
+
+            if gene not in gene_set:
+                continue
+
+            row = {
+                "gene":
+                    gene,
+
+                "niche":
+                    group,
+
+                "pval":
+                    float(p),
+
+                "fdr":
+                    float(padj),
+
+                "logFC":
+                    float(fc),
+            }
+
+            if sample_name is not None:
+
+                row["sample"] = str(
+                    sample_name
+                )
+
+            de_results.append(
+                row
+            )
+
+    return pd.DataFrame(
+        de_results
+    )
+
+
 class IDEANModel:
     """High-level IDEA-N wrapper with optional conditional reconstruction."""
 
@@ -644,6 +1533,7 @@ class IDEANModel:
         lr_domain=None,
         seed=42,
         use_gpu=None,
+        optim = 'NovoGrad'
     ):
         if use_gpu is False:
             self.device = torch.device("cpu")
@@ -682,7 +1572,13 @@ class IDEANModel:
         self.max_cluster = int(max_cluster)
         self.n_clusters = None
         self.pseudo_labels = None
+
+        # subsampled Leiden information
+        self.leiden_subsample_idx = None
+        self.leiden_subsample_labels = None
+
         self.history = pd.DataFrame()
+        self.optim = optim
 
         self.config = {
             "hidden_size": hidden_size,
@@ -736,22 +1632,82 @@ class IDEANModel:
                 "weight_decay": 1e-2,
             },
         ]
-        if self.use_domain_adversarial:
-            stage1_param_groups.append(
+        stage1_param_groups = []
+
+        if self.optim == "NovoGrad":
+
+            stage1_param_groups.extend([
                 {
-                    "params": self.model.batch_classifier.parameters(),
-                    "lr": self.lr_domain,
+                    "params": self.model.vae_encoder.parameters(),
+                    "lr": lr_encoder,
                     "betas": (0.90, 0.98),
                     "weight_decay": 1e-2,
-                }
+                },
+                {
+                    "params": self.model.vae_decoder.parameters(),
+                    "lr": lr_decoder,
+                    "betas": (0.90, 0.98),
+                    "weight_decay": 1e-2,
+                },
+            ])
+
+            if self.use_domain_adversarial:
+                stage1_param_groups.append(
+                    {
+                        "params": self.model.batch_classifier.parameters(),
+                        "lr": self.lr_domain,
+                        "betas": (0.90, 0.98),
+                        "weight_decay": 1e-2,
+                    }
+                )
+
+            self.optimizer_stage1 = optim1.NovoGrad(
+                stage1_param_groups
             )
 
-        # self.optimizer_stage1 = torch.optim.RMSprop([
-        #         {"params": self.model.vae_encoder.parameters(), "lr":lr_decoder, 'weight_decay' : 1e-3, 'eps' : 0.01, 'alpha':0.85},          # encoder 学习率小
-        #         {"params": self.model.vae_decoder.parameters(), "lr": lr_decoder, 'weight_decay' : 1e-3, 'eps' : 0.01, 'alpha':0.85},       # 分类器学习率大
-        #         ])
 
-        self.optimizer_stage1 = optim1.NovoGrad(stage1_param_groups)
+        elif self.optim == "RMSprop":
+
+            stage1_param_groups.extend([
+                {
+                    "params": self.model.vae_encoder.parameters(),
+                    "lr": lr_encoder,
+                    "weight_decay": 1e-3,
+                    "eps": 0.01,
+                    "alpha": 0.85,
+                },
+                {
+                    "params": self.model.vae_decoder.parameters(),
+                    "lr": lr_decoder,
+                    "weight_decay": 1e-3,
+                    "eps": 0.01,
+                    "alpha": 0.85,
+                },
+            ])
+
+            if self.use_domain_adversarial:
+                stage1_param_groups.append(
+                    {
+                        "params": self.model.batch_classifier.parameters(),
+                        "lr": self.lr_domain,
+                        "weight_decay": 1e-3,
+                        "eps": 0.01,
+                        "alpha": 0.85,
+                    }
+                )
+
+            self.optimizer_stage1 = torch.optim.RMSprop(
+                stage1_param_groups
+            )
+
+        else:
+            raise ValueError(
+                f"Unsupported optimizer: {self.optim}. "
+                "Choose from ['NovoGrad', 'RMSprop']."
+            )
+
+
+        
         self.optimizer_stage2 = optim1.NovoGrad(
             self.model.domain_classifier.parameters(),
             lr=lr_classifier,
@@ -873,12 +1829,38 @@ class IDEANModel:
         self,
         stage1_epochs=100,
         stage2_epochs=500,
+
+        # ========================================================
+        # Leiden
+        # ========================================================
+
         n_clusters=None,
         leiden_resolution=1.0,
         leiden_res_range=(0.1, 3.0),
         leiden_res_step=0.1,
         leiden_neighbors=25,
+
+        # ========================================================
+        # Leiden mode
+        #
+        # "full"
+        # "subsample"
+        # ========================================================
+
+        leiden_mode="full",
+
+        # subsampling
+        leiden_subsample_frac=0.1,
+        leiden_min_per_slice=2000,
+        leiden_n_subsample=None,
+
+        # label transfer
+        leiden_transfer_k=5,
+        leiden_transfer_weighted=True,
+        leiden_transfer_chunk_size=100000,
+
         use_posterior_mean_for_clustering=False,
+
         verbose=True,
     ):
         """Two-stage IDEA-N training.
@@ -934,7 +1916,9 @@ class IDEANModel:
                     # DANN schedule from the reference implementation:
                     # alpha starts near 0 and smoothly approaches 1.
                     global_step = epoch * len(train_loader) + step
-                    p = float(global_step) / float(max(n_stage1_steps - 1, 1))
+                    # p = float(global_step) / float(max(n_stage1_steps - 1, 1))
+                    p = float(global_step) / (stage1_epochs * len(train_loader))
+
                     domain_alpha = (
                         2.0 / (1.0 + np.exp(-self.domain_adv_gamma * p)) - 1.0
                     )
@@ -1123,20 +2107,202 @@ class IDEANModel:
                 }
             )
 
-        # Joint representation across all slices/platforms.
+        # ============================================================
+        # Joint representation across all slices/platforms
+        # ============================================================
+
         features = self.get_latent(
-            use_posterior_mean=use_posterior_mean_for_clustering
+            use_posterior_mean=(
+                use_posterior_mean_for_clustering
+            )
         )
-        pseudo_labels = _leiden_pseudo_labels(
-            features,
-            n_clusters=n_clusters,
-            resolution=leiden_resolution,
-            res_range=leiden_res_range,
-            res_step=leiden_res_step,
-            n_neighbors=leiden_neighbors,
-            seed=self.seed,
+
+        # ============================================================
+        # Leiden mode
+        # ============================================================
+
+        leiden_mode = str(
+            leiden_mode
+        ).lower()
+
+        if leiden_mode not in {
+            "full",
+            "subsample",
+        }:
+
+            raise ValueError(
+                "leiden_mode must be "
+                "'full' or 'subsample'."
+            )
+
+
+        # ============================================================
+        # Mode 1: full Leiden
+        # ============================================================
+
+        if leiden_mode == "full":
+
+            print(
+                "[IDEA-N] Running full Leiden "
+                f"on {features.shape[0]:,} spots..."
+            )
+
+            pseudo_labels = (
+                _leiden_pseudo_labels(
+                    features,
+                    n_clusters=n_clusters,
+                    resolution=leiden_resolution,
+                    res_range=leiden_res_range,
+                    res_step=leiden_res_step,
+                    n_neighbors=leiden_neighbors,
+                    seed=self.seed,
+                )
+            )
+
+            self.leiden_subsample_idx = None
+            self.leiden_subsample_labels = None
+
+
+        # ============================================================
+        # Mode 2: sampled Leiden + label transfer
+        # ============================================================
+
+        else:
+
+            print(
+                "[IDEA-N] Running subsampled Leiden "
+                "+ kNN label transfer..."
+            )
+
+            # --------------------------------------------------------
+            # Construct per-spot slice IDs
+            #
+            # Global order:
+            #
+            # sample 0
+            # sample 1
+            # ...
+            #
+            # This is the same order used by self.offsets and
+            # self.get_latent().
+            # --------------------------------------------------------
+
+            slice_ids = None
+
+            if self.n_conditions > 1:
+
+                slice_ids = np.empty(
+                    features.shape[0],
+                    dtype=np.int32,
+                )
+
+                for sample_idx, sample_meta in enumerate(
+                    self.metadata["samples"]
+                ):
+
+                    start = int(
+                        self.offsets[
+                            sample_idx
+                        ]
+                    )
+
+                    n_sample_spots = int(
+                        sample_meta[
+                            "n_spots"
+                        ]
+                    )
+
+                    end = (
+                        start
+                        + n_sample_spots
+                    )
+
+                    slice_ids[
+                        start:end
+                    ] = sample_idx
+
+            # --------------------------------------------------------
+            # Sampled Leiden + transfer
+            # --------------------------------------------------------
+
+            (
+                pseudo_labels,
+                sub_idx,
+                sub_labels,
+            ) = _leiden_subsample_label_transfer(
+
+                features=features,
+
+                # multi-section:
+                # balanced sampling within each slice
+                slice_ids=slice_ids,
+
+                # sampling
+                frac=leiden_subsample_frac,
+                min_per_slice=leiden_min_per_slice,
+                n_subsample=leiden_n_subsample,
+
+                # Leiden
+                n_neighbors=leiden_neighbors,
+                n_clusters=n_clusters,
+                resolution=leiden_resolution,
+                res_range=leiden_res_range,
+                res_step=leiden_res_step,
+
+                # transfer
+                transfer_k=leiden_transfer_k,
+                weighted=leiden_transfer_weighted,
+                transfer_chunk_size=(
+                    leiden_transfer_chunk_size
+                ),
+
+                seed=self.seed,
+            )
+
+            self.leiden_subsample_idx = (
+                sub_idx
+            )
+
+            self.leiden_subsample_labels = (
+                sub_labels
+            )
+
+            del slice_ids
+
+
+        # ============================================================
+        # Store pseudo labels
+        # ============================================================
+
+        self.pseudo_labels = (
+            pseudo_labels.astype(
+                np.int64
+            )
         )
-        self.pseudo_labels = pseudo_labels.astype(np.int64)
+
+        self.n_clusters = int(
+            len(
+                np.unique(
+                    self.pseudo_labels
+                )
+            )
+        )
+
+        if self.n_clusters > self.max_cluster:
+
+            raise ValueError(
+                f"Pseudo-label clustering produced "
+                f"{self.n_clusters} niches, "
+                f"exceeding "
+                f"max_cluster={self.max_cluster}."
+            )
+
+        print(
+            f"[IDEA-N] Final pseudo labels: "
+            f"{self.n_clusters} niches"
+        )
+
+        del features
         self.n_clusters = int(len(np.unique(self.pseudo_labels)))
         if self.n_clusters > self.max_cluster:
             raise ValueError(
@@ -1380,6 +2546,8 @@ class IDEANModel:
         return self
 
 
+
+
     def calculate_de(
         self,
         high_genes=None,
@@ -1388,6 +2556,8 @@ class IDEANModel:
         target_sum=1e4,
         method="wilcoxon",
         best_only=False,
+        max_per_niche=None,
+        random_state=None,
         output_path=None,
     ):
         """
@@ -1396,24 +2566,26 @@ class IDEANModel:
         Parameters
         ----------
         high_genes : list or None
-            Candidate genes to retain.
+            Candidate genes to retain in the returned DE table.
 
             None:
                 return DE statistics for all genes.
 
+            Important:
+                DE itself is still performed over all genes in the
+                IDEA-N gene space, preserving the previous behavior.
+
         mode : {"joint", "per_sample"}
             joint:
-                Pool all sections and calculate shared-niche DE.
+                Pool sections and calculate shared-niche DE.
 
-                Recommended when IDEA-N was trained jointly and the
-                goal is to identify genes consistently associated
-                with shared niches.
+                When max_per_niche is not None, sampling is performed
+                independently within each sample and niche before
+                pooling. This prevents very large sections from
+                dominating the joint sampled dataset.
 
             per_sample:
                 Calculate niche DE independently within each section.
-
-                Useful for checking whether niche-associated genes
-                are reproducible across sections/platforms.
 
             For a single-section model, both modes are equivalent.
 
@@ -1429,6 +2601,32 @@ class IDEANModel:
         best_only : bool
             If True, retain only the most significant niche for
             each gene.
+
+        max_per_niche : int or None
+            Maximum number of spots retained from each niche.
+
+            None:
+                Use all spots. This reproduces the previous full-data
+                DE behavior.
+
+            int:
+                Use stratified sampling.
+
+                Single section:
+                    at most max_per_niche spots per niche.
+
+                joint multi-section:
+                    at most max_per_niche spots per
+                    sample × niche combination.
+
+                per_sample:
+                    at most max_per_niche spots per niche within
+                    each sample.
+
+        random_state : int or None
+            Sampling seed.
+
+            If None, use self.seed when available, otherwise 42.
 
         output_path : str or Path or None
             Optional CSV output path.
@@ -1460,6 +2658,35 @@ class IDEANModel:
 
             raise ValueError(
                 "mode must be 'joint' or 'per_sample'."
+            )
+
+        if max_per_niche is not None:
+
+            max_per_niche = int(
+                max_per_niche
+            )
+
+            if max_per_niche <= 0:
+
+                raise ValueError(
+                    "max_per_niche must be a positive "
+                    "integer or None."
+                )
+
+        if random_state is None:
+
+            random_state = int(
+                getattr(
+                    self,
+                    "seed",
+                    42,
+                )
+            )
+
+        else:
+
+            random_state = int(
+                random_state
             )
 
         # ========================================================
@@ -1521,14 +2748,60 @@ class IDEANModel:
 
         if n_samples == 1:
 
-            X = np.asarray(
-                self.eval_set.X_mms[0],
-                dtype=np.float32,
-            ).copy()
+            mm = self.eval_set.X_mms[0]
 
-            labels = self.pseudo_labels[
-                :X.shape[0]
-            ]
+            n_obs = int(
+                mm.shape[0]
+            )
+
+            labels_all = np.asarray(
+                self.pseudo_labels[
+                    :n_obs
+                ]
+            )
+
+            sample_idx = (
+                _stratified_sample_indices(
+                    labels=labels_all,
+                    max_per_group=max_per_niche,
+                    random_state=random_state,
+                )
+            )
+
+            if sample_idx.size == 0:
+
+                raise ValueError(
+                    "No observations were selected for DE."
+                )
+
+            if max_per_niche is None:
+
+                # Preserve previous full-data behavior.
+                X = np.asarray(
+                    mm,
+                    dtype=np.float32,
+                ).copy()
+
+                labels = labels_all
+
+            else:
+
+                # Important:
+                # only sampled rows are materialized from memmap.
+                X = np.asarray(
+                    mm[sample_idx],
+                    dtype=np.float32,
+                )
+
+                labels = labels_all[
+                    sample_idx
+                ]
+
+                print(
+                    f"[IDEA-N DE] Sampling: "
+                    f"{len(sample_idx):,} / {n_obs:,} spots "
+                    f"(max {max_per_niche:,} per niche)"
+                )
 
             de_df = _run_niche_de(
                 X=X,
@@ -1542,6 +2815,7 @@ class IDEANModel:
             )
 
             del X
+            del labels
 
         # ========================================================
         # 4. Multi-section: joint DE
@@ -1550,32 +2824,150 @@ class IDEANModel:
         elif mode == "joint":
 
             # ----------------------------------------------------
-            # Concatenate all sections.
+            # Full-data mode:
             #
-            # Notice:
-            # this creates one N_total x G matrix in memory.
-            # For very large datasets use mode="per_sample".
+            # Preserve the previous behavior exactly.
             # ----------------------------------------------------
 
-            matrices = []
+            if max_per_niche is None:
 
-            for mm in self.eval_set.X_mms:
+                matrices = []
 
-                matrices.append(
-                    np.asarray(
-                        mm,
-                        dtype=np.float32,
+                for mm in self.eval_set.X_mms:
+
+                    matrices.append(
+                        np.asarray(
+                            mm,
+                            dtype=np.float32,
+                        )
                     )
+
+                X = np.concatenate(
+                    matrices,
+                    axis=0,
                 )
 
-            X = np.concatenate(
-                matrices,
-                axis=0,
-            )
+                labels = self.pseudo_labels[
+                    :X.shape[0]
+                ]
 
-            labels = self.pseudo_labels[
-                :X.shape[0]
-            ]
+                del matrices
+
+            # ----------------------------------------------------
+            # Sampled joint mode:
+            #
+            # Sample each sample × niche independently first.
+            #
+            # This avoids loading complete memmaps and avoids the
+            # largest section dominating the pooled sampled data.
+            # ----------------------------------------------------
+
+            else:
+
+                sampled_X = []
+                sampled_labels = []
+
+                total_before = 0
+                total_after = 0
+
+                for sample_idx, (
+                    sample_name,
+                    mm,
+                ) in enumerate(
+                    zip(
+                        self.condition_names,
+                        self.eval_set.X_mms,
+                    )
+                ):
+
+                    n_obs = int(
+                        mm.shape[0]
+                    )
+
+                    start = int(
+                        self.offsets[
+                            sample_idx
+                        ]
+                    )
+
+                    end = (
+                        start
+                        + n_obs
+                    )
+
+                    labels_all = np.asarray(
+                        self.pseudo_labels[
+                            start:end
+                        ]
+                    )
+
+                    row_idx = (
+                        _stratified_sample_indices(
+                            labels=labels_all,
+                            max_per_group=max_per_niche,
+                            random_state=(
+                                random_state
+                                + sample_idx
+                            ),
+                        )
+                    )
+
+                    if row_idx.size == 0:
+                        continue
+
+                    X_sample = np.asarray(
+                        mm[row_idx],
+                        dtype=np.float32,
+                    )
+
+                    labels_sample = (
+                        labels_all[
+                            row_idx
+                        ]
+                    )
+
+                    sampled_X.append(
+                        X_sample
+                    )
+
+                    sampled_labels.append(
+                        labels_sample
+                    )
+
+                    total_before += n_obs
+                    total_after += len(
+                        row_idx
+                    )
+
+                    print(
+                        f"[IDEA-N DE] {sample_name}: "
+                        f"{len(row_idx):,} / {n_obs:,} spots "
+                        f"(max {max_per_niche:,} per niche)"
+                    )
+
+                if len(sampled_X) == 0:
+
+                    raise ValueError(
+                        "No observations were selected for joint DE."
+                    )
+
+                X = np.concatenate(
+                    sampled_X,
+                    axis=0,
+                )
+
+                labels = np.concatenate(
+                    sampled_labels,
+                    axis=0,
+                )
+
+                print(
+                    f"[IDEA-N DE] Joint sampled dataset: "
+                    f"{total_after:,} / {total_before:,} spots"
+                )
+
+                del sampled_X
+                del sampled_labels
 
             de_df = _run_niche_de(
                 X=X,
@@ -1596,7 +2988,7 @@ class IDEANModel:
             )
 
             del X
-            del matrices
+            del labels
 
         # ========================================================
         # 5. Multi-section: per-sample DE
@@ -1621,10 +3013,9 @@ class IDEANModel:
                     f"{sample_name}"
                 )
 
-                X = np.asarray(
-                    mm,
-                    dtype=np.float32,
-                ).copy()
+                n_obs = int(
+                    mm.shape[0]
+                )
 
                 # ----------------------------------------------
                 # Global pseudo-label interval
@@ -1638,14 +3029,60 @@ class IDEANModel:
 
                 end = (
                     start
-                    + X.shape[0]
+                    + n_obs
                 )
 
-                labels = (
+                labels_all = np.asarray(
                     self.pseudo_labels[
                         start:end
                     ]
                 )
+
+                row_idx = (
+                    _stratified_sample_indices(
+                        labels=labels_all,
+                        max_per_group=max_per_niche,
+                        random_state=(
+                            random_state
+                            + sample_idx
+                        ),
+                    )
+                )
+
+                if row_idx.size == 0:
+
+                    print(
+                        f"[IDEA-N DE] Skip {sample_name}: "
+                        f"no sampled observations."
+                    )
+
+                    continue
+
+                if max_per_niche is None:
+
+                    X = np.asarray(
+                        mm,
+                        dtype=np.float32,
+                    ).copy()
+
+                    labels = labels_all
+
+                else:
+
+                    X = np.asarray(
+                        mm[row_idx],
+                        dtype=np.float32,
+                    )
+
+                    labels = labels_all[
+                        row_idx
+                    ]
+
+                    print(
+                        f"[IDEA-N DE] Sampling: "
+                        f"{len(row_idx):,} / {n_obs:,} spots "
+                        f"(max {max_per_niche:,} per niche)"
+                    )
 
                 current_df = (
                     _run_niche_de(
@@ -1665,6 +3102,13 @@ class IDEANModel:
                 )
 
                 del X
+                del labels
+
+            if len(result_list) == 0:
+
+                raise ValueError(
+                    "No per-sample DE results were generated."
+                )
 
             de_df = pd.concat(
                 result_list,
@@ -1678,7 +3122,10 @@ class IDEANModel:
 
         if best_only:
 
-            if mode == "per_sample" and n_samples > 1:
+            if (
+                mode == "per_sample"
+                and n_samples > 1
+            ):
 
                 de_df = (
                     de_df
@@ -1781,214 +3228,3 @@ class IDEANModel:
             )
 
         return de_df
-
-
-
-# ============================================================
-# Differential expression utilities
-# ============================================================
-
-def _run_niche_de(
-    X,
-    labels,
-    gene_names,
-    high_genes=None,
-    sample_name=None,
-    normalize=True,
-    target_sum=1e4,
-    method="wilcoxon",
-):
-    """
-    Run niche-vs-rest differential expression.
-
-    Parameters
-    ----------
-    X
-        Expression matrix, shape [N, G].
-
-    labels
-        IDEA-N niche labels, shape [N].
-
-    gene_names
-        Gene names corresponding to X columns.
-
-    high_genes
-        Candidate genes to retain in the returned table.
-        DE itself is still performed over all genes in X.
-
-    sample_name
-        Optional section/sample name.
-
-    normalize
-        Whether to normalize_total + log1p.
-
-    target_sum
-        Library size after normalization.
-
-    method
-        Method passed to scanpy.tl.rank_genes_groups.
-    """
-
-    gene_names = np.asarray(
-        gene_names,
-        dtype=str,
-    )
-
-    labels = np.asarray(
-        labels
-    ).astype(str)
-
-    if X.shape[0] != len(labels):
-        raise ValueError(
-            f"X has {X.shape[0]} observations, "
-            f"but labels has {len(labels)}."
-        )
-
-    if X.shape[1] != len(gene_names):
-        raise ValueError(
-            f"X has {X.shape[1]} genes, "
-            f"but gene_names has {len(gene_names)}."
-        )
-
-    # ========================================================
-    # Temporary AnnData
-    # ========================================================
-
-    adata = sc.AnnData(
-        X=X,
-    )
-
-    adata.var_names = gene_names
-
-    adata.obs["niche"] = pd.Categorical(
-        labels
-    )
-
-    # ========================================================
-    # Normalization
-    # ========================================================
-
-    if normalize:
-
-        sc.pp.normalize_total(
-            adata,
-            target_sum=target_sum,
-        )
-
-        sc.pp.log1p(
-            adata
-        )
-
-    # ========================================================
-    # DE
-    #
-    # One call is sufficient.
-    # Each niche is automatically compared against the rest.
-    # ========================================================
-
-    sc.tl.rank_genes_groups(
-        adata,
-        groupby="niche",
-        method=method,
-        reference="rest",
-        pts=True,
-    )
-
-    # ========================================================
-    # Candidate gene filter
-    # ========================================================
-
-    if high_genes is None:
-
-        gene_set = set(
-            gene_names
-        )
-
-    else:
-
-        gene_set = {
-            str(g)
-            for g in high_genes
-        }
-
-    de_results = []
-
-    groups = (
-        adata.obs["niche"]
-        .cat.categories
-    )
-
-    rg = adata.uns[
-        "rank_genes_groups"
-    ]
-
-    # ========================================================
-    # Extract DE statistics
-    # ========================================================
-
-    for group in groups:
-
-        group = str(
-            group
-        )
-
-        names = np.asarray(
-            rg["names"][group]
-        )
-
-        pvals = np.asarray(
-            rg["pvals"][group]
-        )
-
-        pvals_adj = np.asarray(
-            rg["pvals_adj"][group]
-        )
-
-        logfc = np.asarray(
-            rg["logfoldchanges"][group]
-        )
-
-        for gene, p, padj, fc in zip(
-            names,
-            pvals,
-            pvals_adj,
-            logfc,
-        ):
-
-            gene = str(
-                gene
-            )
-
-            if gene not in gene_set:
-                continue
-
-            row = {
-                "gene":
-                    gene,
-
-                "niche":
-                    group,
-
-                "pval":
-                    float(p),
-
-                "fdr":
-                    float(padj),
-
-                "logFC":
-                    float(fc),
-            }
-
-            if sample_name is not None:
-
-                row["sample"] = str(
-                    sample_name
-                )
-
-            de_results.append(
-                row
-            )
-
-    return pd.DataFrame(
-        de_results
-    )

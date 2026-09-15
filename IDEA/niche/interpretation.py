@@ -95,6 +95,15 @@ class NicheBlockForward(nn.Module):
         if self.score_reduction not in {"sum", "mean"}:
             raise ValueError("score_reduction must be 'sum' or 'mean'.")
 
+    def set_target(self, target_mask: torch.Tensor, niche_idx: int):
+        """Update the current niche target without rebuilding the wrapper.
+
+        This only reuses the same forward module / Captum object within a spatial
+        block.  It does not change the attribution definition or model forward.
+        """
+        self.target_mask = target_mask.bool()
+        self.niche_idx = int(niche_idx)
+
     def _forward_one(self, x: torch.Tensor) -> torch.Tensor:
         # x is raw/non-negative count-like input: [N_spots, N_genes]
         x_log = torch.log1p(x).float()
@@ -239,92 +248,157 @@ def explain_niches(
     target_spot_counts = np.zeros(n_clusters, dtype=np.int64)
     contributing_blocks = np.zeros(n_clusters, dtype=np.int64)
 
-    for x, pos, global_idx, _condition_id in tqdm(
-        data_st_set,
-        desc="[IDEA-I niche] blocks",
-    ):
-        x = x.squeeze(0).to(device=device, dtype=torch.float32)
-        pos = pos.squeeze(0).to(device=device, dtype=torch.float32)
-        gi = global_idx.squeeze(0).cpu().numpy()
+    # ------------------------------------------------------------------
+    # Explanation needs gradients with respect to INPUT expression only.
+    # Model-parameter gradients are never used.  Temporarily disabling
+    # requires_grad on parameters preserves the exact forward / input
+    # gradient while reducing autograd bookkeeping and peak memory.
+    # The original flags are restored in the finally block.
+    # ------------------------------------------------------------------
+    parameter_grad_state = [p.requires_grad for p in model.parameters()]
+    model.zero_grad(set_to_none=True)
+    for p in model.parameters():
+        p.requires_grad_(False)
 
-        if not torch.isfinite(x).all():
-            raise FloatingPointError("Non-finite expression values found during explanation.")
-        if torch.any(x < 0):
-            raise ValueError(
-                "Negative expression values found. The IDEA-N explanation path "
-                "expects the same non-negative input space used by the model."
-            )
+    try:
+        for x, pos, global_idx, _condition_id in tqdm(
+            data_st_set,
+            desc="[IDEA-I niche] blocks",
+        ):
+            x = x.squeeze(0).to(device=device, dtype=torch.float32)
+            pos = pos.squeeze(0).to(device=device, dtype=torch.float32)
+            gi = global_idx.squeeze(0).cpu().numpy()
 
-        # Build neighborhoods only within the current block.
-        if hasattr(idean_model, "_build_batch_geometry"):
-            knn_idx, knn_dist, _, _ = idean_model._build_batch_geometry(
-                pos,
-                need_pairwise_distance=False,
-            )
-        else:
-            knn_idx, knn_dist = _knn_from_pos(pos, idean_model.knn_k)
+            if not torch.isfinite(x).all():
+                raise FloatingPointError(
+                    "Non-finite expression values found during explanation."
+                )
+            if torch.any(x < 0):
+                raise ValueError(
+                    "Negative expression values found. The IDEA-N explanation path "
+                    "expects the same non-negative input space used by the model."
+                )
 
-        block_labels = final_labels[gi]
-        niches_in_block = np.unique(block_labels)
-
-        # Captum input has a leading batch dimension of 1 so that the entire
-        # spatial block stays intact at every IG interpolation point.
-        inputs = x.unsqueeze(0)
-        baseline = torch.zeros_like(inputs)
-
-        for niche_idx in niches_in_block:
-            niche_idx = int(niche_idx)
-            if niche_idx < 0 or niche_idx >= n_clusters:
-                continue
-
-            target_mask_np = block_labels == niche_idx
-            n_target = int(target_mask_np.sum())
-            if n_target == 0:
-                continue
-
-            target_spot_counts[niche_idx] += n_target
-            contributing_blocks[niche_idx] += 1
-
-            target_mask = torch.as_tensor(
-                target_mask_np,
-                dtype=torch.bool,
-                device=device,
-            )
-
-            forward_model = NicheBlockForward(
-                model=model,
-                knn_idx=knn_idx,
-                knn_dist=knn_dist,
-                target_mask=target_mask,
-                niche_idx=niche_idx,
-                n_clusters=n_clusters,
-                score_reduction=score_reduction,
-                use_posterior_mean=use_posterior_mean,
-            ).to(device)
-            forward_model.eval()
-
-            ig = IntegratedGradients(forward_model)
-
-            attribution = ig.attribute(
-                inputs=inputs,
-                baselines=baseline,
-                target=None,
-                n_steps=n_steps,
-                # Important: keep one whole spatial block as one Captum example.
-                internal_batch_size=1,
-            )
-
-            # [1, N_spots, N_genes] -> [N_spots, N_genes]
-            attribution = attribution.squeeze(0)
-
-            if attribution_scope == "target_spots":
-                block_gene_contribution = attribution[target_mask].sum(dim=0)
+            # Build neighborhoods only within the current block.
+            if hasattr(idean_model, "_build_batch_geometry"):
+                knn_idx, knn_dist, _, _ = idean_model._build_batch_geometry(
+                    pos,
+                    need_pairwise_distance=False,
+                )
             else:
-                # Includes genes on neighboring spots that influence target spots
-                # through KANA, which is the faithful full-model attribution.
-                block_gene_contribution = attribution.sum(dim=0)
+                knn_idx, knn_dist = _knn_from_pos(pos, idean_model.knn_k)
 
-            gene_contribution[niche_idx] += block_gene_contribution.detach()
+            block_labels = final_labels[gi]
+            niches_in_block = np.unique(block_labels)
+
+            # Captum input has a leading batch dimension of 1 so that the entire
+            # spatial block stays intact at every IG interpolation point.
+            # unsqueeze() is a view and does not duplicate the expression matrix.
+            inputs = x.unsqueeze(0)
+
+            # --------------------------------------------------------------
+            # Reuse ONE forward wrapper and ONE IntegratedGradients object
+            # for all niches in this block. Only target_mask / niche_idx are
+            # updated. The mathematical forward and IG calculation are the
+            # same as constructing a new wrapper for every niche.
+            # --------------------------------------------------------------
+            forward_model = None
+            ig = None
+
+            for niche_idx in niches_in_block:
+                niche_idx = int(niche_idx)
+                if niche_idx < 0 or niche_idx >= n_clusters:
+                    continue
+
+                target_mask_np = block_labels == niche_idx
+                n_target = int(target_mask_np.sum())
+                if n_target == 0:
+                    continue
+
+                target_spot_counts[niche_idx] += n_target
+                contributing_blocks[niche_idx] += 1
+
+                target_mask = torch.as_tensor(
+                    target_mask_np,
+                    dtype=torch.bool,
+                    device=device,
+                )
+
+                if forward_model is None:
+                    forward_model = NicheBlockForward(
+                        model=model,
+                        knn_idx=knn_idx,
+                        knn_dist=knn_dist,
+                        target_mask=target_mask,
+                        niche_idx=niche_idx,
+                        n_clusters=n_clusters,
+                        score_reduction=score_reduction,
+                        use_posterior_mean=use_posterior_mean,
+                    )
+                    # model, KNN tensors and mask are already on the correct
+                    # device, so calling .to(device) here would only recurse
+                    # through the whole trained model again.
+                    ig = IntegratedGradients(forward_model)
+                else:
+                    forward_model.set_target(
+                        target_mask=target_mask,
+                        niche_idx=niche_idx,
+                    )
+
+                attribution = ig.attribute(
+                    inputs=inputs,
+                    # A scalar zero baseline is mathematically identical to an
+                    # explicit torch.zeros_like(inputs), but avoids allocating
+                    # another full [1, N_spots, N_genes] tensor.
+                    baselines=0.0,
+                    target=None,
+                    n_steps=n_steps,
+                    # Important: keep one whole spatial block as one Captum example.
+                    # This intentionally remains 1 to preserve the original memory
+                    # behavior and KANA block semantics.
+                    internal_batch_size=1,
+                )
+
+                # [1, N_spots, N_genes] -> [N_spots, N_genes]
+                attribution = attribution.squeeze(0)
+
+                if attribution_scope == "target_spots":
+                    block_gene_contribution = attribution[target_mask].sum(dim=0)
+                else:
+                    # Includes genes on neighboring spots that influence target spots
+                    # through KANA, which is the faithful full-model attribution.
+                    block_gene_contribution = attribution.sum(dim=0)
+
+                gene_contribution[niche_idx].add_(
+                    block_gene_contribution.detach()
+                )
+
+                # Release large niche-specific tensors before the next IG call.
+                # This matters because attribution has shape [N_spots, N_genes].
+                del block_gene_contribution
+                del attribution
+                del target_mask
+                del target_mask_np
+
+            # Release block-level objects before DataLoader yields the next block.
+            if ig is not None:
+                del ig
+            if forward_model is not None:
+                del forward_model
+
+            del inputs
+            del niches_in_block
+            del block_labels
+            del knn_idx
+            del knn_dist
+            del gi
+            del pos
+            del x
+
+    finally:
+        # Restore the model exactly to its pre-explanation trainability state.
+        for p, requires_grad in zip(model.parameters(), parameter_grad_state):
+            p.requires_grad_(requires_grad)
 
     contribution_np = gene_contribution.detach().cpu().numpy()
 

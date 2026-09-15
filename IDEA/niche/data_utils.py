@@ -172,928 +172,426 @@ def _prepare_niche_data_from_merged_path(
     sample_names=None,
     condition_key="sample_key",
     spatial_key="spatial",
-
     target=4096,
     max_spots=6000,
     min_spots=1000,
-
     sliding=False,
     stride=None,
-
     min_genes=None,
     min_cells=None,
-
     use_hvg=True,
     n_top_hvg=1000,
     hvg_flavor="seurat_v3",
     hvg_layer=None,
-
     retain_adata=False,
     retain_obs_columns=None,
-
     memmap_chunk=20000,
 ):
+    """Prepare one merged multi-section h5ad with exactly one h5ad read.
+
+    The merged AnnData is loaded into memory once, then individual sections are
+    accessed as in-memory views (or temporary copies only when filtering is
+    requested).  HVG selection and final memmap/block construction therefore do
+    not reopen or re-read the h5ad from disk.
+
+    This mode trades higher peak RAM during preparation for substantially lower
+    repeated HDF5 I/O.  After all final expression memmaps are written, the
+    merged AnnData is released before the model is returned.
     """
-    Prepare a merged h5ad containing multiple spatial sections.
 
-    The merged h5ad is opened in backed mode. Individual sections are
-    materialized one at a time according to ``condition_key``.
-
-    This avoids loading the complete merged expression matrix into RAM.
-    """
-
-    # ========================================================
+    # ------------------------------------------------------------------
     # 0. Input
-    # ========================================================
-
+    # ------------------------------------------------------------------
     path = Path(st_ad)
-
     if not path.exists():
-        raise FileNotFoundError(
-            f"Input h5ad does not exist: {path}"
-        )
-
+        raise FileNotFoundError(f"Input h5ad does not exist: {path}")
     if condition_key is None:
         raise ValueError(
-            "condition_key must be provided for "
-            "a merged multi-section h5ad."
+            "condition_key must be provided for a merged multi-section h5ad."
         )
 
-    output_dir = Path(
-        output_dir
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # 1. Read the merged h5ad exactly once
+    # ------------------------------------------------------------------
+    print("[IDEA-N] Merged-h5ad single-read mode enabled.")
+    print(f"[IDEA-N] Loading merged h5ad once: {path}")
+    merged = sc.read_h5ad(path)
+
+    condition_values, sample_names = _get_samples_from_merged_backed(
+        merged,
+        condition_key=condition_key,
+        sample_names=sample_names,
     )
+    n_samples = len(sample_names)
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    # Precompute row indexers once.  When a section occupies one contiguous
+    # interval, use a Python slice instead of a large integer-index array.
+    sample_indexers = {}
+    sample_sizes_raw = {}
+    for sample_name in sample_names:
+        idx = np.flatnonzero(condition_values == str(sample_name))
+        if len(idx) == 0:
+            raise ValueError(f"No observations found for sample {sample_name!r}.")
 
-    # ========================================================
-    # 1. Open merged file in backed mode
-    # ========================================================
+        start = int(idx[0])
+        end = int(idx[-1]) + 1
+        if end - start == len(idx):
+            indexer = slice(start, end)
+            layout = "contiguous"
+        else:
+            indexer = idx.astype(np.int64, copy=False)
+            layout = "indexed"
 
-    print(
-        "[IDEA-N] Merged-h5ad streaming mode enabled."
-    )
-
-    print(
-        f"[IDEA-N] Source: {path}"
-    )
-
-    print(
-        f"[IDEA-N] Splitting sections by "
-        f"obs[{condition_key!r}]"
-    )
-
-    merged = sc.read_h5ad(
-        path,
-        backed="r",
-    )
-
-    try:
-
-        (
-            condition_values,
-            sample_names,
-        ) = _get_samples_from_merged_backed(
-            merged,
-            condition_key=condition_key,
-            sample_names=sample_names,
-        )
-
-        n_samples = len(
-            sample_names
-        )
-
+        sample_indexers[str(sample_name)] = indexer
+        sample_sizes_raw[str(sample_name)] = int(len(idx))
         print(
-            f"[IDEA-N] Found {n_samples} sections:"
+            f"[IDEA-N] {sample_name}: {len(idx):,} spots "
+            f"({layout} rows in merged h5ad)"
         )
 
-        for name in sample_names:
-            n = int(
-                np.sum(
-                    condition_values
-                    == str(name)
-                )
-            )
+    # Small local helper.  No disk read occurs here because `merged` is already
+    # fully in memory.  A copy is created only when Scanpy filtering must modify
+    # the section independently.
+    def _get_sample(sample_name, copy_for_filter=False):
+        ad = merged[sample_indexers[str(sample_name)], :]
+        if copy_for_filter:
+            ad = ad.copy()
+        return ad
 
-            print(
-                f"    {name}: {n:,} spots"
-            )
+    filtering_requested = (min_genes is not None) or (min_cells is not None)
 
-        # ====================================================
-        # Pass 1
-        #
-        # Determine shared genes after filtering.
-        #
-        # Only one section is loaded at a time.
-        # ====================================================
-
+    # ------------------------------------------------------------------
+    # 2. Shared candidate gene space
+    # ------------------------------------------------------------------
+    # A merged AnnData already has one unified var_names.  Therefore, when no
+    # per-section gene filtering is requested, there is no need for a separate
+    # common-gene pass.
+    if min_cells is None:
+        common_genes = merged.var_names.astype(str).tolist()
+    else:
+        # Per-section min_cells can remove different genes, so determine the
+        # post-filter intersection.  This is still in-memory and does not reopen
+        # the h5ad.
         gene_sets = []
-
         for sample_name in sample_names:
-
-            print(
-                f"[IDEA-N] Reading genes for "
-                f"{sample_name}..."
-            )
-
-            adata = _load_one_sample_from_merged(
-                backed_adata=merged,
-                condition_values=condition_values,
-                sample_name=sample_name,
-            )
-
-            # ----------------------------------------------
-            # Optional filtering
-            # ----------------------------------------------
-
+            print(f"[IDEA-N] Filtering genes for {sample_name}...")
+            adata = _get_sample(sample_name, copy_for_filter=True)
             _apply_filters_inplace(
                 adata,
                 min_genes=min_genes,
                 min_cells=min_cells,
             )
-
-            # Preserve your current IDEA-N gene filter
-            sc.pp.filter_genes(
-                adata,
-                min_cells=10,
-            )
-
-            genes = set(
-                adata.var_names.astype(str)
-            )
-
-            gene_sets.append(
-                genes
-            )
-
+            gene_sets.append(set(adata.var_names.astype(str)))
             del adata
             gc.collect()
 
-        # ====================================================
-        # Shared gene space
-        # ====================================================
-
-        if n_samples > 1:
-
-            common_genes = sorted(
-                set.intersection(
-                    *gene_sets
-                )
-            )
-
-        else:
-
-            common_genes = sorted(
-                gene_sets[0]
-            )
-
+        common_genes = (
+            sorted(set.intersection(*gene_sets))
+            if n_samples > 1
+            else sorted(gene_sets[0])
+        )
         del gene_sets
         gc.collect()
 
-        if len(common_genes) == 0:
-            raise ValueError(
-                "No shared genes were found "
-                "across merged sections."
+    if not common_genes:
+        raise ValueError("No shared genes were found across sections.")
+
+    print(f"[IDEA-N] Number of shared candidate genes: {len(common_genes)}")
+
+    # ------------------------------------------------------------------
+    # 3. Section-wise HVG selection from the in-memory merged AnnData
+    # ------------------------------------------------------------------
+    if use_hvg:
+        hvg_union = set()
+
+        for sample_name in sample_names:
+            print(f"[IDEA-N] Selecting HVGs for {sample_name}...")
+
+            adata = _get_sample(
+                sample_name,
+                copy_for_filter=filtering_requested,
             )
-
-        print(
-            f"[IDEA-N] Number of common genes: "
-            f"{len(common_genes)}"
-        )
-
-        # ====================================================
-        # Pass 2
-        #
-        # HVG selection section by section.
-        # ====================================================
-
-        if use_hvg:
-
-            hvg_union = set()
-
-            for sample_name in sample_names:
-
-                print(
-                    f"[IDEA-N] Selecting HVGs for "
-                    f"{sample_name}..."
-                )
-
-                adata = _load_one_sample_from_merged(
-                    backed_adata=merged,
-                    condition_values=condition_values,
-                    sample_name=sample_name,
-                )
-
-                if "long" in str(sample_name):
-
-                    if "annotation" in adata.obs:
-                        adata.obs["domain"] = (
-                            adata.obs["annotation"]
-                        )
-
-                    if "count" in adata.layers:
-                        adata.X = (
-                            adata.layers["count"]
-                        )
-
+            if filtering_requested:
                 _apply_filters_inplace(
                     adata,
                     min_genes=min_genes,
                     min_cells=min_cells,
                 )
 
-                # ------------------------------------------
-                # Common-gene view only; no .copy()
-                # ------------------------------------------
-
-                missing = [
-                    gene
-                    for gene in common_genes
-                    if gene not in adata.var_names
-                ]
-
-                if missing:
-                    raise RuntimeError(
-                        f"{len(missing)} common genes "
-                        f"are missing in {sample_name}."
-                    )
-
-                ad_view = adata[
-                    :,
-                    common_genes,
-                ]
-
-                n_top = min(
-                    int(n_top_hvg),
-                    int(ad_view.n_vars),
+            missing = [g for g in common_genes if g not in adata.var_names]
+            if missing:
+                raise RuntimeError(
+                    f"Common-gene consistency failed for {sample_name}; "
+                    f"examples: {missing[:10]}"
                 )
 
-                if n_top <= 0:
-                    raise ValueError(
-                        f"No genes available for "
-                        f"HVG selection in {sample_name}."
-                    )
-
-                hvg_result = (
-                    sc.pp.highly_variable_genes(
-                        ad_view,
-                        n_top_genes=n_top,
-                        flavor=hvg_flavor,
-                        layer=hvg_layer,
-                        subset=False,
-                        inplace=False,
-                    )
-                )
-
-                if (
-                    "highly_variable"
-                    not in hvg_result.columns
-                ):
-                    raise RuntimeError(
-                        f"HVG selection failed for "
-                        f"{sample_name}."
-                    )
-
-                batch_hvgs = (
-                    ad_view.var_names[
-                        np.asarray(
-                            hvg_result[
-                                "highly_variable"
-                            ],
-                            dtype=bool,
-                        )
-                    ]
-                    .tolist()
-                )
-
-                hvg_union.update(
-                    batch_hvgs
-                )
-
-                print(
-                    f"[IDEA-N] {sample_name}: "
-                    f"{len(batch_hvgs)} HVGs"
-                )
-
-                del hvg_result
-                del ad_view
-                del adata
-
-                gc.collect()
-
-            gene_names = sorted(
-                hvg_union
-            )
-
-            if len(gene_names) == 0:
+            ad_view = adata[:, common_genes]
+            n_top = min(int(n_top_hvg), int(ad_view.n_vars))
+            if n_top <= 0:
                 raise ValueError(
-                    "The union of section-specific "
-                    "HVGs is empty."
+                    f"No genes available for HVG selection in {sample_name}."
                 )
 
-            gene_selection = (
-                "common_genes_hvg_union"
-                if n_samples > 1
-                else "single_section_hvg"
+            hvg_result = sc.pp.highly_variable_genes(
+                ad_view,
+                n_top_genes=n_top,
+                flavor=hvg_flavor,
+                layer=hvg_layer,
+                subset=False,
+                inplace=False,
             )
+            if "highly_variable" not in hvg_result.columns:
+                raise RuntimeError(f"HVG selection failed for {sample_name}.")
 
-            print(
-                f"[IDEA-N] Final HVG union: "
-                f"{len(gene_names)} genes"
-            )
+            batch_hvgs = ad_view.var_names[
+                np.asarray(hvg_result["highly_variable"], dtype=bool)
+            ].astype(str).tolist()
+            hvg_union.update(batch_hvgs)
+            print(f"[IDEA-N] {sample_name}: {len(batch_hvgs)} HVGs")
 
-        else:
+            del hvg_result
+            del ad_view
+            del adata
+            gc.collect()
 
-            gene_names = list(
-                common_genes
-            )
+        gene_names = sorted(hvg_union)
+        if not gene_names:
+            raise ValueError("The union of section-specific HVGs is empty.")
 
-            gene_selection = (
-                "common_genes"
-                if n_samples > 1
-                else "all_filtered_genes"
-            )
+        gene_selection = (
+            "common_genes_hvg_union" if n_samples > 1 else "single_section_hvg"
+        )
+        print(f"[IDEA-N] Final HVG union: {len(gene_names)} genes")
+    else:
+        gene_names = sorted(common_genes)
+        gene_selection = (
+            "common_genes" if n_samples > 1 else "all_filtered_genes"
+        )
+        print(f"[IDEA-N] HVG disabled: using {len(gene_names)} genes")
 
-            print(
-                f"[IDEA-N] HVG disabled: "
-                f"using {len(gene_names)} genes"
-            )
+    del common_genes
+    gc.collect()
 
-        del common_genes
-        gc.collect()
+    # ------------------------------------------------------------------
+    # 4. Build blocks and final expression memmaps
+    # ------------------------------------------------------------------
+    # This is a second *in-memory section pass*, not a second h5ad read.
+    adatas = []
+    coords_list = []
+    memmap_infos = []
+    train_records = []
+    eval_records = []
+    per_sample_meta = []
+    offsets = []
+    offset = 0
 
-        # ====================================================
-        # Pass 3
-        #
-        # Blocks + expression memmap
-        # ====================================================
+    for sample_idx, sample_name in enumerate(sample_names):
+        print(f"[IDEA-N] Preparing {sample_name}...")
 
-        adatas = []
-
-        coords_list = []
-        memmap_infos = []
-
-        train_records = []
-        eval_records = []
-
-        per_sample_meta = []
-
-        offsets = []
-
-        offset = 0
-
-        for sample_idx, sample_name in enumerate(
-            sample_names
-        ):
-
-            print(
-                f"[IDEA-N] Preparing "
-                f"{sample_name}..."
-            )
-
-            # ================================================
-            # Only current section enters RAM
-            # ================================================
-
-            adata = _load_one_sample_from_merged(
-                backed_adata=merged,
-                condition_values=condition_values,
-                sample_name=sample_name,
-            )
-
-            # ----------------------------------------------
-            # Dataset-specific expression source
-            # ----------------------------------------------
-
-            if "long" in str(sample_name):
-
-                if "annotation" in adata.obs:
-                    adata.obs["domain"] = (
-                        adata.obs["annotation"]
-                    )
-
-                if "count" in adata.layers:
-                    adata.X = (
-                        adata.layers["count"]
-                    )
-
+        adata = _get_sample(
+            sample_name,
+            copy_for_filter=filtering_requested,
+        )
+        if filtering_requested:
             _apply_filters_inplace(
                 adata,
                 min_genes=min_genes,
                 min_cells=min_cells,
             )
 
-            # ----------------------------------------------
-            # Guarantee final gene set
-            # ----------------------------------------------
-
-            missing = [
-                gene
-                for gene in gene_names
-                if gene not in adata.var_names
-            ]
-
-            if missing:
-                raise RuntimeError(
-                    f"Final gene set is not available "
-                    f"in {sample_name}. "
-                    f"Examples: {missing[:10]}"
-                )
-
-            # ----------------------------------------------
-            # Make sample identity explicit
-            # ----------------------------------------------
-
-            adata.obs[
-                "sample_key"
-            ] = str(
-                sample_name
+        missing = [g for g in gene_names if g not in adata.var_names]
+        if missing:
+            raise RuntimeError(
+                f"Final gene set is not available in {sample_name}. "
+                f"Examples: {missing[:10]}"
             )
 
-            # =================================================
-            # Spatial coordinates
-            # =================================================
+        coords = _coords_from_adata(adata, spatial_key)
+        coords_list.append(np.asarray(coords, dtype=np.float32))
+        offsets.append(offset)
 
-            coords = _coords_from_adata(
-                adata,
-                spatial_key,
-            )
+        safe_name = _safe_filename(sample_name)
+        block_size = auto_tune_block_size(
+            coords,
+            target=target,
+            max_spots=max_spots,
+        )
 
-            coords_list.append(
-                coords
-            )
+        eval_block2spots, block_id, eval_meta = build_blocks(
+            coords,
+            block_size,
+            min_spots=min_spots,
+            max_spots=max_spots,
+        )
+        np.save(output_dir / f"{safe_name}_block_id.npy", block_id)
 
-            offsets.append(
-                offset
-            )
-
-            # =================================================
-            # Spatial block size
-            # =================================================
-
-            safe_name = _safe_filename(
-                sample_name
-            )
-
-            block_size = (
-                auto_tune_block_size(
-                    coords,
-                    target=target,
-                    max_spots=max_spots,
-                )
-            )
-
-            # =================================================
-            # Evaluation blocks
-            # =================================================
-
-            (
-                eval_block2spots,
-                block_id,
-                eval_meta,
-            ) = build_blocks(
+        if sliding:
+            train_block2spots, coverage, train_meta = build_blocks_sliding(
                 coords,
                 block_size,
+                stride=stride,
                 min_spots=min_spots,
                 max_spots=max_spots,
             )
-
-            np.save(
-                output_dir
-                / f"{safe_name}_block_id.npy",
-                block_id,
-            )
-
-            # =================================================
-            # Stage-1 blocks
-            # =================================================
-
-            if sliding:
-
-                (
-                    train_block2spots,
-                    coverage,
-                    train_meta,
-                ) = build_blocks_sliding(
-                    coords,
-                    block_size,
-                    stride=stride,
-                    min_spots=min_spots,
-                    max_spots=max_spots,
+            if np.any(coverage == 0):
+                print(
+                    f"[IDEA-N] Warning: {(coverage == 0).sum()} spots in "
+                    f"{sample_name} are not present in Stage-1 sliding blocks. "
+                    "They remain covered by eval blocks for latent inference, "
+                    "Leiden, Stage 2, and prediction."
                 )
-
-                if np.any(
-                    coverage == 0
-                ):
-
-                    print(
-                        f"[IDEA-N] Warning: "
-                        f"{(coverage == 0).sum()} "
-                        f"spots in {sample_name} "
-                        f"are not included in "
-                        f"Stage-1 sliding blocks."
-                    )
-
-            else:
-
-                train_block2spots = (
-                    eval_block2spots
-                )
-
-                train_meta = dict(
-                    eval_meta
-                )
-
-                train_meta[
-                    "stride"
-                ] = None
-
-            # =================================================
-            # Expression -> disk memmap
-            #
-            # No adata[:, gene_names].copy()
-            # =================================================
-
-            info = _write_memmap(
-                adata,
-                output_dir
-                / f"{safe_name}_X_memmap.dat",
-                gene_names=gene_names,
-                chunk=memmap_chunk,
-            )
-
-            memmap_infos.append(
-                info
-            )
-
-            np.save(
-                output_dir
-                / f"{safe_name}_coords.npy",
-                coords,
-            )
-
-            # =================================================
-            # Block records
-            # =================================================
-
-            _append_block_records(
-                train_records,
-                train_block2spots,
-                sample_idx=sample_idx,
-                offset=offset,
-            )
-
-            _append_block_records(
-                eval_records,
-                eval_block2spots,
-                sample_idx=sample_idx,
-                offset=offset,
-            )
-
-            n_obs = int(
-                adata.n_obs
-            )
-
-            # =================================================
-            # Metadata
-            # =================================================
-
-            per_sample_meta.append(
-                {
-                    "sample_name":
-                        str(sample_name),
-
-                    "source_h5ad":
-                        str(path),
-
-                    "source_condition_key":
-                        str(condition_key),
-
-                    "condition_id":
-                        int(sample_idx),
-
-                    "n_spots":
-                        n_obs,
-
-                    "n_genes":
-                        int(
-                            len(
-                                gene_names
-                            )
-                        ),
-
-                    "block_size":
-                        float(
-                            block_size
-                        ),
-
-                    "n_train_blocks":
-                        int(
-                            len(
-                                train_block2spots
-                            )
-                        ),
-
-                    "n_eval_blocks":
-                        int(
-                            len(
-                                eval_block2spots
-                            )
-                        ),
-
-                    "max_train_block_spots":
-                        int(
-                            max(
-                                len(v)
-                                for v
-                                in train_block2spots.values()
-                            )
-                        ),
-
-                    "max_eval_block_spots":
-                        int(
-                            max(
-                                len(v)
-                                for v
-                                in eval_block2spots.values()
-                            )
-                        ),
-
-                    "train_block_meta":
-                        train_meta,
-
-                    "eval_block_meta":
-                        eval_meta,
-
-                    "expression_memmap":
-                        dict(info),
-                }
-            )
-
-            # =================================================
-            # What model.adatas retains
-            # =================================================
-
-            if retain_adata:
-
-                # ------------------------------------------
-                # Compatibility mode:
-                # keeps expression and therefore consumes RAM
-                # ------------------------------------------
-
-                kept = (
-                    adata[
-                        :,
-                        gene_names,
-                    ]
-                    .copy()
-                )
-
-                kept.obs[
-                    "sample_key"
-                ] = str(
-                    sample_name
-                )
-
-                adatas.append(
-                    kept
-                )
-
-                del kept
-
-            else:
-
-                # ------------------------------------------
-                # Recommended large-data mode
-                # ------------------------------------------
-
-                light = (
-                    _make_lightweight_adata(
-                        adata=adata,
-                        gene_names=gene_names,
-                        spatial_key=spatial_key,
-                        coords=coords,
-                        sample_name=sample_name,
-                        memmap_info=info,
-                        retain_obs_columns=(
-                            retain_obs_columns
-                        ),
-                    )
-                )
-
-                light.uns[
-                    "IDEAN_source_h5ad"
-                ] = str(
-                    path
-                )
-
-                light.uns[
-                    "IDEAN_source_condition_key"
-                ] = str(
-                    condition_key
-                )
-
-                adatas.append(
-                    light
-                )
-
-                del light
-
-            # =================================================
-            # Global offset
-            # =================================================
-
-            offset += n_obs
-
-            # =================================================
-            # Release current section
-            # =================================================
-
-            del train_block2spots
-            del eval_block2spots
-            del block_id
-
-            if sliding:
-                del coverage
-
-            del adata
-
-            gc.collect()
-
-        # ====================================================
-        # Condition metadata
-        # ====================================================
-
-        condition_mapping = {
-            str(name): int(i)
-            for i, name
-            in enumerate(
-                sample_names
-            )
-        }
-
-        metadata = {
-            "input_mode":
-                "merged_path_streaming",
-
-            "source_h5ad":
-                str(path),
-
-            "retain_adata":
-                bool(retain_adata),
-
-            "n_samples":
-                int(n_samples),
-
-            "n_conditions":
-                int(n_samples),
-
-            "sample_names":
-                [
-                    str(x)
-                    for x
-                    in sample_names
-                ],
-
-            "condition_names":
-                [
-                    str(x)
-                    for x
-                    in sample_names
-                ],
-
-            "condition_mapping":
-                condition_mapping,
-
-            "condition_key":
-                str(condition_key),
-
-            "n_spots":
-                int(offset),
-
-            "n_genes":
-                int(
-                    len(
-                        gene_names
-                    )
-                ),
-
-            "gene_selection":
-                gene_selection,
-
-            "n_top_hvg":
-                (
-                    int(n_top_hvg)
-                    if use_hvg
-                    else None
-                ),
-
-            "hvg_flavor":
-                (
-                    str(hvg_flavor)
-                    if use_hvg
-                    else None
-                ),
-
-            "hvg_layer":
-                hvg_layer,
-
-            "n_train_blocks":
-                int(
-                    len(
-                        train_records
-                    )
-                ),
-
-            "n_eval_blocks":
-                int(
-                    len(
-                        eval_records
-                    )
-                ),
-
-            "target":
-                int(target),
-
-            "min_spots":
-                int(min_spots),
-
-            "max_spots":
-                int(max_spots),
-
-            "sliding":
-                bool(sliding),
-
-            "stride":
-                (
-                    None
-                    if stride is None
-                    else float(stride)
-                ),
-
-            "memmap_chunk":
-                int(
-                    memmap_chunk
-                ),
-
-            "samples":
-                per_sample_meta,
-        }
-
-        # ====================================================
-        # Save metadata
-        # ====================================================
-
-        with open(
-            output_dir
-            / "niche_metadata.json",
-            "w",
-            encoding="utf-8",
-        ) as f:
-
-            json.dump(
-                metadata,
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
-
-        # ====================================================
-        # Dataset
-        # ====================================================
-
-        train_set = NicheBlockDataset(
-            memmap_infos,
-            coords_list,
+        else:
+            train_block2spots = eval_block2spots
+            train_meta = dict(eval_meta)
+            train_meta["stride"] = None
+
+        # _write_memmap performs chunk-wise float32 conversion and selected-gene
+        # extraction, so there is no need to convert the complete section X to a
+        # CSR float32 copy first.
+        info = _write_memmap(
+            adata,
+            output_dir / f"{safe_name}_X_memmap.dat",
+            gene_names=gene_names,
+            chunk=memmap_chunk,
+        )
+        memmap_infos.append(info)
+        np.save(output_dir / f"{safe_name}_coords.npy", coords)
+
+        _append_block_records(
             train_records,
+            train_block2spots,
+            sample_idx=sample_idx,
+            offset=offset,
         )
-
-        eval_set = NicheBlockDataset(
-            memmap_infos,
-            coords_list,
+        _append_block_records(
             eval_records,
+            eval_block2spots,
+            sample_idx=sample_idx,
+            offset=offset,
         )
 
-        return (
-            adatas,
-            train_set,
-            eval_set,
-            gene_names,
-            offsets,
-            metadata,
-        )
+        n_obs = int(adata.n_obs)
+        sample_meta = {
+            "sample_name": str(sample_name),
+            "source_h5ad": str(path),
+            "source_condition_key": str(condition_key),
+            "condition_id": int(sample_idx),
+            "n_spots_raw": int(sample_sizes_raw[str(sample_name)]),
+            "n_spots": n_obs,
+            "n_genes": int(len(gene_names)),
+            "block_size": float(block_size),
+            "n_train_blocks": int(len(train_block2spots)),
+            "n_eval_blocks": int(len(eval_block2spots)),
+            "max_train_block_spots": int(
+                max(len(v) for v in train_block2spots.values())
+            ),
+            "max_eval_block_spots": int(
+                max(len(v) for v in eval_block2spots.values())
+            ),
+            "train_block_meta": train_meta,
+            "eval_block_meta": eval_meta,
+            "expression_memmap": dict(info),
+        }
+        per_sample_meta.append(sample_meta)
 
-    finally:
+        if retain_adata:
+            kept = adata[:, gene_names].copy()
+            kept.obs["sample_key"] = str(sample_name)
+            adatas.append(kept)
+            del kept
+        else:
+            light = _make_lightweight_adata(
+                adata=adata,
+                gene_names=gene_names,
+                spatial_key=spatial_key,
+                coords=coords,
+                sample_name=sample_name,
+                memmap_info=info,
+                retain_obs_columns=retain_obs_columns,
+            )
+            light.uns["IDEAN_source_h5ad"] = str(path)
+            light.uns["IDEAN_source_condition_key"] = str(condition_key)
+            adatas.append(light)
+            del light
 
-        _close_backed(
-            merged
-        )
+        offset += n_obs
 
-        del merged
-
+        del train_block2spots
+        del eval_block2spots
+        del block_id
+        if sliding:
+            del coverage
+        del adata
         gc.collect()
+
+    # ------------------------------------------------------------------
+    # 5. Metadata + datasets
+    # ------------------------------------------------------------------
+    condition_mapping = {
+        str(name): int(i) for i, name in enumerate(sample_names)
+    }
+
+    metadata = {
+        "input_mode": "merged_path_single_read",
+        "source_h5ad": str(path),
+        "merged_h5ad_reads": 1,
+        "retain_adata": bool(retain_adata),
+        "n_samples": int(n_samples),
+        "n_conditions": int(n_samples),
+        "sample_names": [str(x) for x in sample_names],
+        "condition_names": [str(x) for x in sample_names],
+        "condition_mapping": condition_mapping,
+        "condition_key": str(condition_key),
+        "n_spots": int(offset),
+        "n_genes": int(len(gene_names)),
+        "gene_selection": gene_selection,
+        "n_top_hvg": int(n_top_hvg) if use_hvg else None,
+        "hvg_flavor": str(hvg_flavor) if use_hvg else None,
+        "hvg_layer": hvg_layer,
+        "n_train_blocks": int(len(train_records)),
+        "n_eval_blocks": int(len(eval_records)),
+        "target": int(target),
+        "min_spots": int(min_spots),
+        "max_spots": int(max_spots),
+        "sliding": bool(sliding),
+        "stride": None if stride is None else float(stride),
+        "memmap_chunk": int(memmap_chunk),
+        "samples": per_sample_meta,
+    }
+
+    with open(
+        output_dir / "niche_metadata.json",
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+    # Release the full merged expression matrix before training starts.
+    del merged
+    gc.collect()
+
+    train_set = NicheBlockDataset(
+        memmap_infos,
+        coords_list,
+        train_records,
+    )
+    eval_set = NicheBlockDataset(
+        memmap_infos,
+        coords_list,
+        eval_records,
+    )
+
+    return (
+        adatas,
+        train_set,
+        eval_set,
+        gene_names,
+        offsets,
+        metadata,
+    )
 
 def _load_one_sample_from_merged(
     backed_adata,
@@ -1313,7 +811,7 @@ def build_blocks_sliding(
     if block_size <= 0:
         raise ValueError("block_size must be positive.")
     if stride is None:
-        stride = block_size / 1.2
+        stride = block_size / 2
     if stride <= 0:
         raise ValueError("stride must be positive.")
     if min_spots <= 0:
@@ -2358,7 +1856,7 @@ def prepare_niche_data(
     # ---------------------------------------------------------------------
     # Memory controls
     # ---------------------------------------------------------------------
-    retain_adata=True,
+    retain_adata=False,
     retain_obs_columns=None,
     copy_input=True,
     memmap_chunk=20000,

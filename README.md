@@ -39,6 +39,34 @@ Install the required dependencies:
 pip install -r requirements.txt
 ```
 
+### Installation time
+
+Installation typically takes approximately 5–10 minutes, depending on internet speed and the local software environment.
+
+## System requirements
+
+IDEA has been tested on:
+
+- Microsoft Windows 11, version 25H2 (OS build 26200.9445)
+- Ubuntu 24.04.4 LTS (Noble Numbat)
+- Python 3.10
+- NVIDIA CUDA-compatible GPUs
+
+## Using IDEA on your own data
+
+IDEA accepts spatial transcriptomics data stored as an AnnData object.
+
+For spatial niche identification, the input should contain:
+
+* a gene-expression matrix in `adata.X`;
+* spatial coordinates in `adata.obsm`;
+* sample identifiers for multi-slice analyses, where applicable.
+
+For cell-type composition inference, IDEA additionally requires a matched scRNA-seq reference with cell-type annotations.
+
+Spatial and reference datasets should contain a common set of genes.
+
+Users are encouraged to follow the corresponding tutorial for each analysis task.
 
 ## Tutorials
 
@@ -57,9 +85,20 @@ The datasets used in the IDEA study were originally generated and published by p
 
 Dataset descriptions and download links are provided in the corresponding data repository:
 
-**Data repository:** [Zenodo: Datasets](https://zenodo.org/records/22145448)
+**Data repository:** [Zenodo](https://doi.org/10.5281/zenodo.22145448)
 
 No newly generated experimental sequencing data are included in the repository.
+
+## Expected runtime
+
+Approximate runtimes for the tutorial workflows were measured on an NVIDIA GeForce RTX 4090 GPU. Runtime may vary depending on hardware configuration, dataset size, and preprocessing settings.
+
+| Tutorial | Dataset size | Preprocessing | Model training | Clustering / resolution search | Gene-level interpretation |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Low-resolution cell-type composition inference | 71 spatial units | ~10 min | ~2 min | – | ~2 s |
+| High-resolution cell-type composition inference | 115,165 spatial units | ~3 min | ~5 min | – | ~13 min |
+| Single-slice spatial niche identification | 123,836 spatial units, 1,022 genes | –  | ~6 min | ~9 min | ~5 min |
+| Multi-slice spatial niche identification | 714,252 spatial units, 299 genes | – | ~12 min | ~60 min | ~6 min |
 
 
 ## License
