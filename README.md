@@ -98,7 +98,7 @@ Approximate runtimes for the tutorial workflows were measured on an NVIDIA GeFor
 | Low-resolution cell-type composition inference | 71 spatial units | ~10 min | ~2 min | – | ~2 s |
 | High-resolution cell-type composition inference | 115,165 spatial units | ~3 min | ~5 min | – | ~13 min |
 | Single-slice spatial niche identification | 123,836 spatial units, 1,022 genes | –  | ~6 min | ~9 min | ~5 min |
-| Multi-slice spatial niche identification | 714,252 spatial units, 299 genes | – | ~12 min | ~60 min | ~6 min |
+| Multi-slice spatial niche identification | 714,252 spatial units, 299 genes | – | ~12 min | ~40 min | ~6 min |
 
 
 ## License
