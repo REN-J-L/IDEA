@@ -74,6 +74,7 @@ Example workflows are provided for:
 
 * Single-slice spatial niche identification and niche-associated gene analysis
 * Multi-slice spatial niche identification and niche-associated gene analysis
+* Multi-slice spatial niche identification and niche-associated gene analysis for whole_mouse_brain_atlas
 * Cell-type composition inference and cell-type-associated gene analysis for high-resolution datasets
 * Cell-type composition inference and cell-type-associated gene analysis for low-resolution datasets
 
@@ -98,8 +99,8 @@ Approximate runtimes for the tutorial workflows were measured on an NVIDIA GeFor
 | Low-resolution cell-type composition inference | 71 spatial units | ~10 min | ~2 min | – | ~2 s |
 | High-resolution cell-type composition inference | 115,165 spatial units | ~3 min | ~5 min | – | ~13 min |
 | Single-slice spatial niche identification | 123,836 spatial units, 1,022 genes | –  | ~6 min | ~9 min | ~5 min |
-| Multi-slice spatial niche identification | 714,252 spatial units, 299 genes | – | ~12 min | ~40 min | ~6 min |
-
+| Multi-slice spatial niche identification (Xenium kidney dataset) | 714,252 spatial units, 299 genes | – | ~12 min | ~40 min | ~6 min |
+| Multi-slice spatial niche identification (MERFISH whole mouse brain atlas) | 8,380,288 spatial units, 1022 genes | – | ~115 min | ~953 min | ~62 min |
 
 ## License
 
